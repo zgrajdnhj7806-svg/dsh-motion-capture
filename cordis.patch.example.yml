@@ -1,0 +1,6 @@
+# 在 DSH profile 的 cordis.patch.yml 里追加下面这段即可挂载本插件。
+# 路径请换成插件实际所在位置；Windows 下写成 file:///C:/... 形式。
+plugins:
+  - insert:
+      - id: motion-capture
+        name: 'file:///C:/Users/<you>/WorkBuddy/dsh-motion-capture/dsh-motion-capture.mjs'
