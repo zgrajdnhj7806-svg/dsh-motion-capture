@@ -1,0 +1,58 @@
+name: complete-source
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Complete tail
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('dsh-motion-capture.mjs')
+          t = p.read_text(encoding='utf-8')
+          t = t[:t.rfind('\n') + 1]
+          tail = (
+              '    ctx.logger?.warn?.(new Error(`motion-capture: 工具注册失败：${String(error)}`))\n'
+              '    throw error\n'
+              '  }\n'
+              '\n'
+              '  ctx.logger?.info?.(`motion-capture v${VERSION} 已挂载（缓存目录 ${ROOT}）`)\n'
+              '\n'
+              '  return () => {\n'
+              '    for (const dispose of registered.reverse()) {\n'
+              "      try { if (typeof dispose === 'function') dispose() } catch { /* 退场不抛 */ }\n"
+              '    }\n'
+              '  }\n'
+              '}\n'
+              '\n'
+              '/** 供测试脚本直接驱动（不经过 DSH）。 */\n'
+              'export const internals = {\n'
+              '  findFfmpeg,\n'
+              '  scanVideo,\n'
+              '  listRuns,\n'
+              '  loadRun,\n'
+              '  purgeRuns,\n'
+              '  parseIndexList,\n'
+              '  frameFiles,\n'
+              '  detectMotion,\n'
+              '  gridMeans,\n'
+              '  drawText,\n'
+              '  ROOT,\n'
+              '  VERSION,\n'
+              '}\n'
+          )
+          p.write_text(t + tail, encoding='utf-8', newline='\n')
+          PY
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add dsh-motion-capture.mjs
+          git rm -q -f .github/workflows/fix-tail.yml
+          git commit -m 'fix: complete motion-capture source tail'
+          git push
