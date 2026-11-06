@@ -2146,4 +2146,31 @@ export function apply(ctx) {
       },
     }))
   } catch (error) {
-    ctx.logger?.warn?.(new Error(`motion-capture: 工具注册失败：${String(error)}`
+    ctx.logger?.warn?.(new Error(`motion-capture: 工具注册失败：${String(error)}`))
+    throw error
+  }
+
+  ctx.logger?.info?.(`motion-capture v${VERSION} 已挂载（缓存目录 ${ROOT}）`)
+
+  return () => {
+    for (const dispose of registered.reverse()) {
+      try { if (typeof dispose === 'function') dispose() } catch { /* 退场不抛 */ }
+    }
+  }
+}
+
+/** 供测试脚本直接驱动（不经过 DSH）。 */
+export const internals = {
+  findFfmpeg,
+  scanVideo,
+  listRuns,
+  loadRun,
+  purgeRuns,
+  parseIndexList,
+  frameFiles,
+  detectMotion,
+  gridMeans,
+  drawText,
+  ROOT,
+  VERSION,
+}
