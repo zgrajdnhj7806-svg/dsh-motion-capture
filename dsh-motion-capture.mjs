@@ -1951,4 +1951,235 @@ function imageBlockFromRef(ref) {
   return {
     type: 'image',
     attachment: {
-      attachmentId
+      attachmentId: ref.attachmentId,
+      mediaType: ref.mediaType,
+      bytes: ref.bytes,
+      width: ref.width,
+      height: ref.height,
+      ...ref.name === undefined ? {} : { name: ref.name },
+    },
+  }
+}
+
+async function attachPng(ctx, filePath) {
+  const attachments = ctx.get('attachments')
+  if (attachments === undefined) return undefined
+  try {
+    const data = readFileSync(filePath)
+    const ref = await attachments.saveImage({ data, mediaType: 'image/png', name: basename(filePath) })
+    return ref
+  } catch {
+    return undefined
+  }
+}
+
+export function apply(ctx) {
+  const registered = []
+  try {
+    registered.push(ctx.tools.register({
+      name: 'motion_capture',
+      description: [
+        '【动态物体捕捉 · 结构化运动分析】只提供给能读图片的多模态模型：当前路由未声明 image 输入时直接拒绝调用，不做纯文本降级。',
+        '给一个视频路径，返回三层结果，按这个顺序读最省力：',
+        '1) 文字运动分析（analysis_text）：每个跨帧物体一个固定编号 #1/#2…，给出起点/终点（画面百分比）、净位移方向、',
+        '   平均与最快速度（源像素/秒）、方向序列、逐帧位置——只读文字就能回答“谁在动、往哪动、多快”。',
+        '2) 运动总图 analysis.png：暗化首帧上叠“运动历史”——每个采样点按时间着色（蓝=早、红=晚），',
+        '   一眼看出哪片区域在动、先后顺序；下半部是逐帧速度曲线，竖红条=爆闪帧。',
+        '3) 帧拼图 sheet1.png：每帧原图带编号 #0001、运动红点与渐变箭头，运动物体上另有 #N 标签；',
+        '   FLASH 帧单独进 flash1.png（只有红色外框，没有运动点）。',
+        '文字与图片共用同一套编号，互相能对上；红点=帧间运动采样点，箭头=上一帧到当前帧的位移（尾淡头亮），',
+        '标注颜色按局部背景自动取高对比色（默认红，背景偏红时转青/绿/品红）。',
+        '帧标题：T=时间秒、N=点数、A=箭头数、V=该帧最快位移（px/s）。',
+        '爆闪/爆炸/转场这类大块亮度剧变会单独归类，不画运动点（防满屏噪点、防计算量失控）。',
+        '所有帧、轨迹图、analysis.json 都在临时缓存目录，可用 action=runs / purge 查看或清理。',
+        '',
+        'action=scan：给 video_path，返回结构化轨迹 + 文字分析 + 拼图/轨迹图。',
+        'action=frames：run_id + indices（如 "1,3,5-8"）取单帧原图，用于放大看细节。',
+        'action=runs / purge：查看或清理临时图片缓存。',
+        '',
+        '设计与成本：低采样率（默认 2fps）+ 小宽度（默认 360）单趟解码，帧差在纯 JS 网格上做，耗时/能耗远低于逐帧全分辨率分析；',
+        '若当前模型路由未声明 image 输入，scan/frames 会直接报错并提示切换视觉模型（不降级成纯文本）。',
+        '镜头整体位移会被自动估计并补偿：文字里的“镜头”是镜头自身位移，轨迹只表示相对背景的物体真实运动。',
+        '看不清运动方向时：降低 fps 让每帧位移更大，或调高 onion（残影更明显）、trail 设 3。',
+      ].join('\n'),
+      parameters: PARAMETERS,
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+          properties: {
+            action: { type: 'string' },
+            runId: { type: 'string' },
+            dir: { type: 'string' },
+            source: { type: 'object', additionalProperties: true },
+            window: { type: 'object', additionalProperties: true },
+            sampling: { type: 'object', additionalProperties: true },
+            display: { type: 'object', additionalProperties: true },
+            moving_frames: { type: 'number' },
+            flash_frames: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            flash_sheets: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            analysis: { type: 'object', additionalProperties: true },
+            analysis_text: { type: 'string' },
+            frames: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            blobs: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            sheets: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            images: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            runs: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            removed: { type: 'array', items: { type: 'string' } },
+            image_capable: { type: 'boolean' },
+            hint: { type: 'string' },
+            elapsed_ms: { type: 'number' },
+            text: { type: 'string' },
+          },
+        },
+        render: (_args, value) => {
+          const blocks = [textBlock(value.text ?? '（无输出）')]
+          if (Array.isArray(value.images)) {
+            for (const image of value.images) blocks.push(imageBlockFromRef(image))
+          }
+          return blocks
+        },
+      },
+      presentCall: (args) => ({
+        card: 'generic',
+        title: args.action === 'scan'
+          ? `动态捕捉 ${args.video_path ?? ''}`
+          : `动态捕捉 · ${args.action}`,
+        kind: 'read',
+      }),
+      async execute(args, exec) {
+        const startedAt = Date.now()
+        const action = args.action
+        if (action === 'scan') {
+          if (typeof args.video_path !== 'string' || args.video_path.trim().length === 0) {
+            throw new Error('scan 需要 video_path（视频绝对路径）')
+          }
+          // 先检查模型能力：不能读图就直接拒绝，避免白跑一遍抽帧
+          const capable = await requireImageModel(ctx, exec)
+          const value = await scanVideo(args, exec.signal)
+          const maxImages = Math.round(clampNumber(args.max_images, 1, 6, MAX_SHEET_IMAGES))
+          const images = []
+          {
+            // 第 1 张永远是运动总图，其余按容量给帧拼图，最后补一张爆闪拼图
+            const queue = []
+            if (existsSync(value.analysis.png)) queue.push({ path: value.analysis.png, sheet: null })
+            for (const sheet of value.sheets.slice(0, Math.max(1, maxImages - 1))) queue.push({ path: sheet.path, sheet })
+            if (value.flash_sheets.length > 0 && queue.length < 6) queue.push({ path: value.flash_sheets[0].path, sheet: value.flash_sheets[0] })
+            for (const item of queue) {
+              const ref = await attachPng(ctx, item.path)
+              if (ref === undefined) continue
+              images.push({
+                attachmentId: ref.attachmentId, mediaType: ref.mediaType, bytes: ref.bytes,
+                width: ref.width, height: ref.height, name: ref.name,
+              })
+              if (item.sheet !== null) item.sheet.attached = true
+            }
+          }
+          const lines = summarizeScan(value)
+          lines.push(`已把 ${images.length} 张图作为图片输入回传：第 1 张是运动总图 analysis.png，其余是帧拼图（每张最多 ${SHEET_COLS * SHEET_ROWS} 帧，按编号顺序；有爆闪时它排在最后）。`)
+          return {
+            action,
+            runId: value.runId,
+            dir: value.dir,
+            source: value.source,
+            window: value.window,
+            sampling: value.sampling,
+            display: value.display,
+            moving_frames: value.moving_frames,
+            flash_frames: value.flash_frames,
+            flash_sheets: value.flash_sheets,
+            analysis: value.analysis,
+            analysis_text: value.analysis_text,
+            frames: value.stats,
+            sheets: value.sheets,
+            images,
+            image_capable: capable,
+            elapsed_ms: Date.now() - startedAt,
+            text: lines.join('\n'),
+            hint: '需要看某一帧细节：action=frames 配 run_id + indices。',
+          }
+        }
+
+        if (action === 'frames') {
+          if (typeof args.run_id !== 'string' || args.run_id.length === 0) throw new Error('frames 需要 run_id（先 scan 或用 action=runs 查）')
+          const capable = await requireImageModel(ctx, exec)
+          const meta = loadRun(args.run_id)
+          const indices = parseIndexList(args.indices, meta.stats.length)
+          const files = frameFiles(args.run_id, indices)
+          const maxImages = Math.round(clampNumber(args.max_images, 1, 6, 4))
+          const images = []
+          for (const file of files.slice(0, maxImages)) {
+            if (!existsSync(file.path)) continue
+            const ref = await attachPng(ctx, file.path)
+            if (ref !== undefined) {
+              images.push({ attachmentId: ref.attachmentId, mediaType: ref.mediaType, bytes: ref.bytes, width: ref.width, height: ref.height, name: ref.name })
+            }
+          }
+          const chosen = files.slice(0, maxImages)
+          const lines = [`读取 ${meta.runId} 的帧：${chosen.map(file => `#${String(file.index).padStart(4, '0')}`).join(' ')}`]
+          for (const file of files) {
+            const stat = meta.stats.find(item => item.index === file.index)
+            if (stat === undefined) continue
+            lines.push(`#${String(stat.index).padStart(4, '0')} t=${stat.time_s}s N=${stat.points.length} cells=${stat.moving_cells} v=${stat.speed_px_s}px/s${stat.flash === null ? '' : ` FLASH ${Math.round(stat.flash.ratio * 100)}%`} 文件=${file.path}`)
+          }
+          return {
+            action,
+            runId: meta.runId,
+            dir: meta.dir,
+            frames: files.map(file => ({ index: file.index, path: file.path, time_s: file.time_s })),
+            images,
+            image_capable: capable,
+            elapsed_ms: Date.now() - startedAt,
+            text: lines.join('\n'),
+          }
+        }
+
+        if (action === 'runs') {
+          const runs = listRuns()
+          return { action, runs, text: summaryOfRuns(runs).join('\n'), elapsed_ms: Date.now() - startedAt }
+        }
+
+        if (action === 'purge') {
+          const result = purgeRuns(args)
+          return {
+            action,
+            removed: result.removed,
+            text: result.removed.length === 0
+              ? `没有需要清理的运行（保留 ${clampNumber(args.ttl_h, 0, 720, 12)} 小时）。`
+              : `已清理 ${result.removed.length} 个运行：${result.removed.join(', ')}`,
+            elapsed_ms: Date.now() - startedAt,
+          }
+        }
+
+        throw new Error(`未知 action：${String(action)}`)
+      },
+    }))
+  } catch (error) {
+    ctx.logger?.warn?.(new Error(`motion-capture: 工具注册失败：${String(error)}`))
+    throw error
+  }
+
+  ctx.logger?.info?.(`motion-capture v${VERSION} 已挂载（缓存目录 ${ROOT}）`)
+
+  return () => {
+    for (const dispose of registered.reverse()) {
+      try { if (typeof dispose === 'function') dispose() } catch { /* 退场不抛 */ }
+    }
+  }
+}
+
+/** 供测试脚本直接驱动（不经过 DSH）。 */
+export const internals = {
+  findFfmpeg,
+  scanVideo,
+  listRuns,
+  loadRun,
+  purgeRuns,
+  parseIndexList,
+  frameFiles,
+  detectMotion,
+  gridMeans,
+  drawText,
+  ROOT,
+  VERSION,
+}
