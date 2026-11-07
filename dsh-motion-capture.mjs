@@ -1048,6 +1048,15 @@ function analysisLines({ tracks, stats, sourceW, sourceH, sampling, window }) {
   const lines = []
   lines.push('【运动分析（文字版，直接读这段就能回答“怎么动的”）】')
   lines.push(`窗口 ${window.start}s 起 ${window.length}s；${sampling.fps}fps 共 ${stats.length} 帧；源 ${sourceW}×${sourceH}`)
+  if (sampling.interval_s !== undefined) {
+    const coverage = sampling.coverage_pct === undefined || sampling.coverage_pct === null
+      ? ''
+      : `，只看过源帧的 ${sampling.coverage_pct}%`
+    lines.push(`采样间隔 ${sampling.interval_s}s：两帧之间的源帧没有被读取${coverage}；持续短于 ${sampling.interval_s}s 的物体可能整段漏掉（要抓瞬态请提高 fps 或缩小 duration_s）`)
+  }
+  if (sampling.reduced === true) {
+    lines.push(`已按 max_frames 降采样：请求 ${sampling.requested_fps}fps → 实际 ${sampling.fps}fps（${sampling.frames} 帧）；长视频建议提高 max_frames，或分段扫描`)
+  }
   const flashes = stats.filter(stat => stat.flash !== null)
   if (flashes.length > 0) {
     lines.push(`爆闪/大面积突变 ${flashes.length} 帧：${flashes.slice(0, 8).map(stat => `#${String(stat.index).padStart(4, '0')}@${stat.time_s}s(${Math.round(stat.flash.ratio * 100)}%)`).join('、')}${flashes.length > 8 ? ' …' : ''}`)
@@ -1205,6 +1214,13 @@ function parseDimensions(stderr) {
   const match = /Video:[\s\S]*?(\d{2,5})x(\d{2,5})/.exec(stderr)
   if (match === null) return undefined
   return { width: Number(match[1]), height: Number(match[2]) }
+}
+
+/** 源视频帧率：用于说明“采样间隔相对源帧丢了多少”。 */
+function parseFrameRate(stderr) {
+  const match = /(\d+(?:\.\d+)?)\s*fps/iu.exec(stderr)
+  if (match === null) return undefined
+  return Number(match[1])
 }
 
 function newRunId(videoPath) {
@@ -1670,12 +1686,23 @@ export async function scanVideo(options, signal) {
       })
       .filter(Boolean),
   }))
+  // 采样诊断（只报告事实，不自动改参数）：间隔多少秒、比请求低了多少、覆盖了多少源帧
+  const sourceFps = parseFrameRate(probeStderr)
+  const sampling = {
+    fps: Math.round(fps * 100) / 100,
+    requested_fps: Math.round(fpsWanted * 100) / 100,
+    interval_s: Math.round((1 / fps) * 1000) / 1000,
+    frames: stats.length,
+    reduced: fps < fpsWanted - 1e-6,
+    source_fps: sourceFps === undefined ? null : Math.round(sourceFps * 100) / 100,
+    coverage_pct: sourceFps === undefined ? null : Math.round((fps / sourceFps) * 1000) / 10,
+  }
   const analysisText = analysisLines({
     tracks,
     stats,
     sourceW,
     sourceH,
-    sampling: { fps: Math.round(fps * 100) / 100 },
+    sampling,
     window: { start: startSeek, length: Math.round(window * 100) / 100 },
   }).join('\n')
   const analysisJson = join(dir, 'analysis.json')
@@ -1700,7 +1727,7 @@ export async function scanVideo(options, signal) {
     source,
     duration_s: duration,
     window: { start: startSeek, length: Math.round(window * 100) / 100 },
-    sampling: { fps: Math.round(fps * 100) / 100, requested_fps: fpsWanted, frames: stats.length },
+    sampling,
     display: { width, height, grid: [gridCols, rows], dot_size: dotSize, sensitivity, onion, trail: trailLength, arrows: drawArrows, min_area: minArea, max_tracks: maxTracks },
     moving_frames: movingFrames,
     flash_frames: flashFrames,
@@ -1895,7 +1922,10 @@ function summarizeScan(value) {
   lines.push(`动态捕捉完成：${value.runId}`)
   lines.push(`视频：${value.video}`)
   const src = value.source ?? {}
-  lines.push(`源尺寸 ${src.width ?? '?'}×${src.height ?? '?'}；窗口 ${value.window.start}s 起 ${value.window.length}s；采样 ${value.sampling.fps}fps × ${value.sampling.frames} 帧（显示宽 ${value.display?.width ?? '?'}）`)
+  const diag = value.sampling?.interval_s === undefined
+    ? ''
+    : `；间隔 ${value.sampling.interval_s}s${value.sampling.coverage_pct === null || value.sampling.coverage_pct === undefined ? '' : `、源帧覆盖 ${value.sampling.coverage_pct}%`}${value.sampling.reduced === true ? '（已按 max_frames 降采样）' : ''}`
+  lines.push(`源尺寸 ${src.width ?? '?'}×${src.height ?? '?'}；窗口 ${value.window.start}s 起 ${value.window.length}s；采样 ${value.sampling.fps}fps × ${value.sampling.frames} 帧（显示宽 ${value.display?.width ?? '?'}${diag}）`)
   lines.push(`有运动的帧：${value.moving_frames}/${value.stats.length}；耗时 ${value.elapsed_ms}ms`)
   lines.push(`运动总图：${value.analysis.png}（暗化首帧上叠运动历史：蓝=早、红=晚，看时间先后；下半部是每帧速度曲线，竖红条=爆闪帧）`)
   lines.push(`结构化数据：${value.analysis.json}；纯文字报告：${value.analysis.txt}`)
