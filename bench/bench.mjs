@@ -31,7 +31,7 @@ const PLUGIN_OPTIONS = {
   max_tracks: 8,
   sensitivity: 0.7,
   dot_size: 3,
-  min_area: 3,
+  min_area: 1,
   onion: 0.45,
   trail: 2,
   arrows: true,
@@ -158,7 +158,8 @@ function scoreScene(name, truth, result) {
     const dirJudgeable = gtShape.path > 0 && gtShape.net / gtShape.path >= 0.25
     if (dirJudgeable && gtFirst !== null && gtLast !== null && (gtLast.t - gtFirst.t) > 0.2) {
       const gtDir = directionSign(gtLast.x - gtFirst.x, gtLast.y - gtFirst.y)
-      const gotDir = directionSign(track.net.dx_pct, track.net.dy_pct)
+      // x_pct/y_pct 分别按宽/高归一化，直接比大小会歪掉方向；先换回像素空间
+      const gotDir = directionSign(track.net.dx_pct * truth.width, track.net.dy_pct * truth.height)
       dirOK = gtDir === gotDir
     }
     rows.push({
@@ -186,9 +187,14 @@ function scoreScene(name, truth, result) {
   const dirFails = recalled.filter(row => row.dirOK === false).length
   const flashHit = result.flash_frames.length
   const flashExpected = truth.flashWindows.length
+  // 暗场/细颗粒场景：先要求“看得出有运动”，否则就是 v=0 的真实失败
+  const ratios = result.stats.map(stat => stat.motion_ratio ?? 0)
+  const avgMotionRatio = ratios.length === 0 ? 0 : ratios.reduce((sum, value) => sum + value, 0) / ratios.length
+  const motionRequired = truth.minMotionRatio ?? null
+  const motionOK = motionRequired === null || avgMotionRatio >= motionRequired
 
-  const pass = recallPct === 100 && falsePositives.length === 0 && fragmentation === 0 && worstPos <= 6 && dirFails === 0
-  const warn = recallPct >= 60 && worstPos <= 12
+  const pass = recallPct === 100 && falsePositives.length === 0 && fragmentation === 0 && worstPos <= 6 && dirFails === 0 && motionOK
+  const warn = recallPct >= 60 && worstPos <= 12 && motionOK
   const verdict = pass ? 'PASS' : (warn ? 'WARN' : 'FAIL')
 
   return {
@@ -201,6 +207,7 @@ function scoreScene(name, truth, result) {
     worstPosPct: round(worstPos),
     dirFails,
     flash: { expected: flashExpected, detected: flashHit },
+    motion: { avgRatio: round(avgMotionRatio * 100, 2), required: motionRequired === null ? null : round(motionRequired * 100, 2), ok: motionOK },
     rows,
     movers: movingRows.length,
     tracks: result.analysis.tracks.length,
@@ -246,7 +253,7 @@ function suggestions(score) {
 
 function printScore(score) {
   console.log(`\n── ${score.name} ｜ ${score.label}`)
-  console.log(`   结论 ${score.verdict} ｜ 召回 ${score.recallPct}% ｜ 误检 ${score.falsePositives} ｜ 碎片 ${score.fragmentation} ｜ 最大位置误差 ${score.worstPosPct}% ｜ 方向错 ${score.dirFails} ｜ 爆闪 ${score.flash.detected}/${score.flash.expected}`)
+  console.log(`   结论 ${score.verdict} ｜ 召回 ${score.recallPct}% ｜ 误检 ${score.falsePositives} ｜ 碎片 ${score.fragmentation} ｜ 最大位置误差 ${score.worstPosPct}% ｜ 方向错 ${score.dirFails} ｜ 爆闪 ${score.flash.detected}/${score.flash.expected} ｜ 运动占比 ${score.motion.avgRatio}%${score.motion.required === null ? '' : `（需 ≥ ${score.motion.required}%）`}`)
   for (const row of score.rows) {
     if (!row.moving) {
       console.log(`   · ${row.id.padEnd(10)} ${row.note}`)

@@ -74,23 +74,84 @@ export const SCENES = {
     ],
     flashWindows: [],
   },
+
+  // 复现“暗场 + 低对比度 + 细灰尘 + 慢雾 + 噪点”这种最容易 v=0 的现场素材：
+  // 物体只比背景亮十几个灰阶、细颗粒在缩到评测宽度后仅 1~2 像素，背景还有整屏噪点与缓慢漂移的雾。
+  'dark-ash': {
+    label: '暗场细灰烬：低对比度 + 细颗粒 + 慢雾 + 噪点',
+    width: 960,
+    height: 540,
+    fps: 30,
+    duration: 6,
+    grid: false,
+    bg: { base: 9, x: 4, y: 3, line: [15, 15, 18] },
+    grain: 1.8,
+    haze: { amp: 2.5, speedPx: 6 },
+    objects: [
+      { id: 'ember-a', shape: 'box', size: 5, color: [21, 21, 23], kind: 'linear', from: [110, 140], vel: [42, 18] },
+      { id: 'ember-b', shape: 'box', size: 5, color: [22, 22, 24], kind: 'linear', from: [520, 110], vel: [-36, 26] },
+      { id: 'ember-c', shape: 'circle', size: 4, color: [20, 20, 22], kind: 'linear', from: [280, 420], vel: [28, -14] },
+      { id: 'drift', shape: 'circle', size: 16, color: [24, 24, 27], kind: 'osc', axis: 'x', center: [720, 400], amp: 60, period: 6 },
+      // 静止对照：暗场里也不能把固定物体报成运动
+      { id: 'post', shape: 'box', size: 26, color: [30, 28, 24], kind: 'static', from: [880, 80] },
+    ],
+    flashWindows: [],
+    // 暗场里至少要能看到运动，否则就是“整段 v=0”的失败现场
+    minMotionRatio: 0.003,
+  },
 }
 
 /** 双线性背景：深色渐变 + 细网格，保证有静态纹理但不会自己产生运动。 */
-function drawBackground(buf, w, h, grid) {
+function drawBackground(buf, w, h, scene) {
+  const bg = scene.bg ?? {}
+  const base = bg.base ?? 26
+  const gradX = bg.x ?? 10
+  const gradY = bg.y ?? 8
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 3
-      const shade = 26 + Math.round((x / w) * 10) + Math.round((y / h) * 8)
+      const shade = base + Math.round((x / w) * gradX) + Math.round((y / h) * gradY)
       buf[i] = shade
       buf[i + 1] = shade + 2
       buf[i + 2] = shade + 6
     }
   }
-  if (!grid) return
-  const line = [46, 50, 60]
+  if (scene.grid !== true) return
+  const line = bg.line ?? [46, 50, 60]
   for (let x = 0; x < w; x += 40) fillRect(buf, w, h, x, 0, 1, h, line)
   for (let y = 0; y < h; y += 40) fillRect(buf, w, h, 0, y, w, 1, line)
+}
+
+const clampByte = value => (value < 0 ? 0 : (value > 255 ? 255 : value))
+
+/** 整屏噪点（暗场/高感素材的底色），逐帧不同但幅度固定，用来考验阈值是否够稳。 */
+function addGrain(buf, w, h, amount, seed) {
+  let state = (seed * 2654435761 + 12345) >>> 0
+  for (let i = 0; i < buf.length; i += 3) {
+    state = (state * 1103515245 + 12345) >>> 0
+    const noise = (((state >>> 16) % 1024) / 1024 - 0.5) * 2 * amount
+    const delta = Math.round(noise)
+    buf[i] = clampByte(buf[i] + delta)
+    buf[i + 1] = clampByte(buf[i + 1] + delta)
+    buf[i + 2] = clampByte(buf[i + 2] + delta)
+  }
+}
+
+/** 缓慢漂移的雾：低频亮度起伏，整屏一起动，但每帧变化极小（模拟暗场里的烟雾）。 */
+function addHaze(buf, w, h, haze, t) {
+  const amp = haze.amp ?? 2.5
+  const speed = haze.speedPx ?? 6
+  const phase = t * speed
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 3
+      const wave = amp * (Math.sin((x + phase) * 0.007 + y * 0.004) + 0.6 * Math.sin((x - phase * 1.7) * 0.013 - y * 0.009))
+      const delta = Math.round(wave)
+      buf[i] = clampByte(buf[i] + delta)
+      buf[i + 1] = clampByte(buf[i + 1] + delta)
+      buf[i + 2] = clampByte(buf[i + 2] + delta)
+    }
+  }
 }
 
 function fillRect(buf, w, h, x, y, rw, rh, rgb) {
@@ -206,6 +267,7 @@ export async function buildScene(name) {
     duration: scene.duration,
     frames,
     flashWindows: scene.flashWindows,
+    minMotionRatio: scene.minMotionRatio ?? null,
     objects: scene.objects.map(obj => ({
       id: obj.id,
       kind: obj.kind,
@@ -219,7 +281,8 @@ export async function buildScene(name) {
   for (let f = 0; f < frames; f++) {
     const t = f / fps
     const buf = new Uint8Array(W * H * 3)
-    drawBackground(buf, W, H, scene.grid)
+    drawBackground(buf, W, H, scene)
+    if (scene.haze !== undefined) addHaze(buf, W, H, scene.haze, t)
     for (const obj of scene.objects) {
       const pos = posAt(obj, t, scene)
       if (!pos.visible) continue
@@ -227,6 +290,7 @@ export async function buildScene(name) {
       const record = truth.objects.find(item => item.id === obj.id)
       record.samples.push({ frame: f, t: Math.round(t * 1000) / 1000, x: Math.round(pos.x * 10) / 10, y: Math.round(pos.y * 10) / 10 })
     }
+    if (scene.grain !== undefined) addGrain(buf, W, H, scene.grain, f)
     const flash = scene.flashWindows.find(win => t >= win.start && t < win.start + win.length)
     if (flash !== undefined) {
       // 爆闪：整屏提亮，模拟爆炸/转场

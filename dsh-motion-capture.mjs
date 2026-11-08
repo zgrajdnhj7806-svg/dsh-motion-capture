@@ -4,8 +4,9 @@
  * 设计目标（按需求逐条对齐）：
  *  1. 快速 + 低能耗：单次 ffmpeg 解码（低采样率 fps + 小宽度），帧差在纯 JS 里做，
  *     不依赖 sharp / opencv / canvas，不逐帧重复解码；不做全分辨率计算。
- *  2. 动态采样点：相邻采样帧的网格灰度差 -> 只保留最强的 K 个互不重叠格子，
- *     在画面上画 3×3 纯红像素（尽量小），红点即“这帧相对上一帧在动的位置”。
+ *  2. 对噪声/暗场友好：逐像素帧差 -> 每格取最强约 5% 像素的均值（细颗粒不被格子均值稀释），
+ *     阈值按“背景中位 + k×下四分位噪声”自适应，暗场低对比度里会自动降到 1~3 灰阶；
+ *     再按 8 邻域连通域成团块、面积/显著度过滤，最后画 3×3 纯红像素（尽量小）。
  *  3. 视频动态帧草稿：每帧左上角烧入递增编号 #0001；再拼成 3×2 的连续大图
  *     （contact sheet，编号放大 3 倍），模型只看编号即可对上时间顺序。
  *  4. 临时缓存：所有 PNG 落在系统临时目录 dsh-motion-capture/<runId>/，
@@ -27,7 +28,7 @@ export const inject = ['tools']
 const VERSION = '0.1.0'
 const ROOT = join(tmpdir(), 'dsh-motion-capture')
 const DEFAULT_FPS = 4
-const DEFAULT_WIDTH = 360
+const DEFAULT_WIDTH = 480
 const MAX_FRAMES = 60
 const SHEET_COLS = 3
 const SHEET_ROWS = 2
@@ -221,35 +222,123 @@ function gridMeans(rgb, width, height, cols, rows) {
   return out
 }
 
+/** 逐像素亮度平面：帧差、阈值估计都复用它，不必为每个格子重算一遍亮度。 */
+function lumaPlane(rgb, width, height) {
+  const plane = new Float32Array(width * height)
+  const end = width * height * 3
+  for (let base = 0, p = 0; base < end; base += 3, p++) {
+    plane[p] = 0.299 * rgb[base] + 0.587 * rgb[base + 1] + 0.114 * rgb[base + 2]
+  }
+  return plane
+}
+
+/**
+ * 网格级“运动能量”：每个格子取最强的那一小撮像素的帧差均值（约最强 12%）。
+ *
+ * 为什么不沿用“格子先取均值、再相减”：细颗粒/灰烬在画面里只有 1~4 像素，
+ * 先把一格（10~15 像素见方）平均掉，信号会被背景稀释到 0.x 灰阶——
+ * 暗场里就永远过不了阈值，表现为“整段视频 v=0”。取强像素能把细结构保住。
+ * 纯噪声场景下每个格子的强像素均值都差不多，交给后面的稳健阈值一起压掉。
+ */
+function cellMotionEnergy(prevLuma, curLuma, width, height, cols, rows, shiftX = 0, shiftY = 0) {
+  const total = cols * rows
+  const energy = new Float32Array(total)
+  const mean = new Float32Array(total)
+  const bright = new Uint32Array(total)
+  const cw = width / cols
+  const ch = height / rows
+  const scratch = new Float32Array(Math.max(4, Math.ceil((cw + 1) * (ch + 1))))
+  let brightPixels = 0
+  for (let cy = 0; cy < rows; cy++) {
+    const y0 = Math.floor(cy * ch)
+    const y1 = Math.max(y0 + 1, Math.floor((cy + 1) * ch))
+    for (let cx = 0; cx < cols; cx++) {
+      const x0 = Math.floor(cx * cw)
+      const x1 = Math.max(x0 + 1, Math.floor((cx + 1) * cw))
+      let n = 0
+      let sum = 0
+      let strongCount = 0
+      for (let y = y0; y < y1; y++) {
+        const prevY = Math.min(height - 1, Math.max(0, y - shiftY))
+        const prevRow = prevY * width
+        const row = y * width
+        for (let x = x0; x < x1; x++) {
+          const prevX = Math.min(width - 1, Math.max(0, x - shiftX))
+          const d = Math.abs(curLuma[row + x] - prevLuma[prevRow + prevX])
+          if (d >= 60) strongCount++
+          sum += d
+          scratch[n++] = d
+        }
+      }
+      const count = Math.max(1, n)
+      const cell = cy * cols + cx
+      mean[cell] = sum / count
+      bright[cell] = strongCount
+      brightPixels += strongCount
+      if (n > 0) {
+        // 最强 5%（至少 2 个、最多 8 个像素）：细颗粒只占格子一小块，也能保住原强度；
+        // 比例再大就会被同格里的背景噪声稀释回阈值以下
+        const top = Math.min(n, Math.max(2, Math.min(8, Math.ceil(n * 0.05))))
+        const view = scratch.subarray(0, n)
+        view.sort()
+        let strongSum = 0
+        for (let i = n - top; i < n; i++) strongSum += view[i]
+        energy[cell] = strongSum / top
+      }
+    }
+  }
+  return { energy, mean, brightPixels }
+}
+
 /**
  * 网格帧差 -> 运动团块 + 采样点。
- * 1) 阈值 = max(最小阈值, 本帧差分中位数 × 2.5)，自适应整体亮度漂移；
+ * 1) 阈值 = max(绝对地板, 背景中位 + k×噪声σ)：σ 由下四分位估计（移动像素不会把它抬高），
+ *    暗场/低对比度里阈值会自动降到 1~3 灰阶，不再被固定的 8.8 地板卡死；
  * 2) 8 邻域连通域把运动格子聚成“物体团块”，面积太小的直接丢（压缩噪声/反光噪点）；
  * 3) 采样点在团块内按强度取，互相隔一格，避免挤成一团；
  * 4) 返回团块质心，供下一帧按质心匹配出运动方向（不依赖纹理，避免棋盘格/条纹周期性误匹配）。
  */
-function detectMotion(prev, cur, cols, rows, minThreshold, maxPoints, minArea) {
+function detectMotion(prev, cur, cols, rows, options = {}) {
   const total = cols * rows
-  const diffs = new Float32Array(total)
+  const sensitivity = clampNumber(options.sensitivity, 0, 1, 0.7)
+  const maxPoints = Math.round(clampNumber(options.maxPoints, 1, 24, 12))
+  const minArea = Math.max(1, Math.round(clampNumber(options.minArea, 1, 40, 1)))
+  // 没传逐像素能量时退回“网格均值差”（内部测试可以直接调这个函数）
+  const fromGrid = options.activity === undefined
+  const diffs = fromGrid ? new Float32Array(total) : options.activity
   let diffSum = 0
   let bright = 0
   let curSum = 0
   let prevSum = 0
+  if (fromGrid) {
+    for (let i = 0; i < total; i++) {
+      diffs[i] = Math.abs(cur[i] - prev[i])
+      diffSum += diffs[i]
+      // 固定阈值统计“大幅变化”面积：自适应阈值在整帧爆闪时会失效，这里单独统计
+      if (diffs[i] >= 60) bright++
+    }
+  } else {
+    for (let i = 0; i < total; i++) {
+      diffSum += diffs[i]
+      if (diffs[i] >= 60) bright++
+    }
+  }
   for (let i = 0; i < total; i++) {
-    diffs[i] = Math.abs(cur[i] - prev[i])
-    diffSum += diffs[i]
     curSum += cur[i]
     prevSum += prev[i]
-    // 固定阈值统计“大幅变化”面积：自适应阈值在整帧爆闪时会失效，这里单独统计
-    if (diffs[i] >= 60) bright++
   }
-  const meanDiff = diffSum / Math.max(1, total)
+  const meanDiff = options.meanDiff ?? diffSum / Math.max(1, total)
   const brightRatio = bright / Math.max(1, total)
   const curMean = curSum / Math.max(1, total)
   const prevMean = prevSum / Math.max(1, total)
   const sorted = Float32Array.from(diffs).sort()
+  const p25 = sorted[Math.floor(total * 0.25)]
   const median = sorted[Math.floor(total * 0.5)]
-  const threshold = Math.max(minThreshold, median * 2.5)
+  // 下四分位到中位的距离 ≈ 0.674σ，且不会被“运动像素”污染
+  const noise = Math.max(0.4, (median - p25) / 0.6745)
+  const k = 2.5 + (1 - sensitivity) * 7
+  const floor = 0.7 + (1 - sensitivity) * 2.5
+  const threshold = Math.max(floor, median + k * noise)
 
   const mask = new Uint8Array(total)
   let moving = 0
@@ -343,7 +432,7 @@ function detectMotion(prev, cur, cols, rows, minThreshold, maxPoints, minArea) {
     y1: Math.max(acc.y1, blob.box.y1),
   }), { x0: cols, y0: rows, x1: -1, y1: -1 })
 
-  return { threshold, moving, ratio: moving / total, meanDiff, brightRatio, curMean, prevMean, blobs, points, bboxCells }
+  return { threshold, noise, median, moving, ratio: moving / total, meanDiff, brightRatio, curMean, prevMean, blobs, points, bboxCells }
 }
 
 /**
@@ -389,39 +478,43 @@ function estimateBlobShift(prev, cur, cols, rows, blob, radius = 3) {
 }
 
 /**
- * 团块显著度：团块区域与周围背景的亮度差。
- * 地面反光/边缘噪声这类“和背景亮度差不多”的伪运动，直接跳过不标注，
- * 避免在空地上出现一排乱指的箭头。
+ * 团块显著度：团块区域内“最强的那几成像素”与周围背景的亮度差。
+ * 不能用格子均值算——细颗粒在 10 像素格子里会被稀释到 0.x 灰阶，
+ * 于是暗场里的真运动会被当成“和背景一样”直接跳过。
  */
-function blobSaliency(grid, blob, cols, rows) {
-  const x0 = blob.box.x0
-  const x1 = blob.box.x1
-  const y0 = blob.box.y0
-  const y1 = blob.box.y1
-  let inside = 0
-  let insideCount = 0
+function blobSaliency(luma, width, height, blob, cellW, cellH) {
+  const x0 = Math.max(0, Math.floor(blob.box.x0 * cellW))
+  const x1 = Math.min(width - 1, Math.ceil((blob.box.x1 + 1) * cellW) - 1)
+  const y0 = Math.max(0, Math.floor(blob.box.y0 * cellH))
+  const y1 = Math.min(height - 1, Math.ceil((blob.box.y1 + 1) * cellH) - 1)
+  const pixels = []
   for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      inside += grid[y * cols + x]
-      insideCount++
-    }
+    const row = y * width
+    for (let x = x0; x <= x1; x++) pixels.push(luma[row + x])
   }
-  if (insideCount === 0) return 0
-  const rx0 = Math.max(0, x0 - 2)
-  const rx1 = Math.min(cols - 1, x1 + 2)
-  const ry0 = Math.max(0, y0 - 2)
-  const ry1 = Math.min(rows - 1, y1 + 2)
+  if (pixels.length === 0) return 0
+  pixels.sort((a, b) => a - b)
+  const top = Math.max(1, Math.ceil(pixels.length * 0.2))
+  let peak = 0
+  for (let i = pixels.length - top; i < pixels.length; i++) peak += pixels[i]
+  peak /= top
+  // 周围一圈（团块外扩 2 格）的背景均值
   let ring = 0
   let ringCount = 0
-  for (let y = ry0; y <= ry1; y++) {
-    for (let x = rx0; x <= rx1; x++) {
+  const rx0 = Math.max(0, x0 - Math.round(cellW * 2))
+  const rx1 = Math.min(width - 1, x1 + Math.round(cellW * 2))
+  const ry0 = Math.max(0, y0 - Math.round(cellH * 2))
+  const ry1 = Math.min(height - 1, y1 + Math.round(cellH * 2))
+  for (let y = ry0; y <= ry1; y += 2) {
+    const row = y * width
+    for (let x = rx0; x <= rx1; x += 2) {
       if (x >= x0 && x <= x1 && y >= y0 && y <= y1) continue
-      ring += grid[y * cols + x]
+      ring += luma[row + x]
       ringCount++
     }
   }
   if (ringCount === 0) return 255
-  return Math.abs(inside / insideCount - ring / ringCount)
+  return Math.abs(peak - ring / ringCount)
 }
 
 /* ───────────────────────────── 洋葱皮 / 箭头 / 智能配色 ───────────────────────────── */
@@ -708,22 +801,27 @@ function blitRgbScaled(dest, destW, destH, src, srcW, srcH, x0, y0, scale) {
  */
 function clusterBlobs(blobs, radius) {
   const groups = []
+  const limitOf = blob => Math.min(radius, blob.merge_radius ?? radius)
   for (const blob of [...blobs].sort((a, b) => b.area - a.area)) {
     let target = null
     for (const group of groups) {
-      if (Math.hypot(group.x - blob.x, group.y - blob.y) <= radius) {
+      const limit = Math.max(group.mergeRadius ?? 0, limitOf(blob))
+      if (Math.hypot(group.x - blob.x, group.y - blob.y) <= limit) {
         target = group
         break
       }
     }
     if (target === null) {
-      groups.push({ x: blob.x, y: blob.y, area: blob.area, w: blob.w, h: blob.h })
+      groups.push({ x: blob.x, y: blob.y, area: blob.area, area_px: blob.area_px ?? 0, salience: blob.salience ?? 0, w: blob.w, h: blob.h, mergeRadius: limitOf(blob) })
       continue
     }
     const total = target.area + blob.area
     target.x = (target.x * target.area + blob.x * blob.area) / total
     target.y = (target.y * target.area + blob.y * blob.area) / total
     target.area = total
+    target.area_px = (target.area_px ?? 0) + (blob.area_px ?? 0)
+    target.salience = Math.max(target.salience ?? 0, blob.salience ?? 0)
+    target.mergeRadius = Math.max(target.mergeRadius ?? 0, limitOf(blob))
   }
   return groups
 }
@@ -763,6 +861,8 @@ function buildTracks(stats, { sourceW, sourceH, fps, maxTracks = 4 }) {
       w: blob.w,
       h: blob.h,
       area: blob.area,
+      area_px: blob.area_px ?? 0,
+      salience: blob.salience ?? 0,
     })
     track.lastFrame = frameIndex
     track.lastX = blob.x
@@ -775,7 +875,7 @@ function buildTracks(stats, { sourceW, sourceH, fps, maxTracks = 4 }) {
   for (let frameIndex = 0; frameIndex < stats.length; frameIndex++) {
     const stat = stats[frameIndex]
     if (stat.flash !== null) continue
-    const candidates = clusterBlobs(stat.blobs.filter(blob => blob.area >= 2), clusterRadius)
+    const candidates = clusterBlobs(stat.blobs.filter(blob => blob.area >= 1), clusterRadius)
       .sort((a, b) => b.area - a.area)
       .slice(0, 10)
       .map(blob => ({ blob, used: false }))
@@ -822,7 +922,7 @@ function buildTracks(stats, { sourceW, sourceH, fps, maxTracks = 4 }) {
     // 只出现 1 个采样帧的物体（爆闪式闪现、极快掠过）也要保留：
     // 否则“1 帧就消失”的目标永远报不出来。用团块面积做门槛，避免留下 1 格噪声
     .filter(track => track.frames.length >= 2 || stats.length === 1
-      || (track.frames.length === 1 && (track.frames[0].area ?? 0) >= 4))
+      || (track.frames.length === 1 && (track.frames[0].area_px ?? 0) >= 700 && (track.frames[0].salience ?? 0) >= 20))
     .map(track => {
       let path = 0
       for (let i = 1; i < track.frames.length; i++) {
@@ -838,6 +938,9 @@ function buildTracks(stats, { sourceW, sourceH, fps, maxTracks = 4 }) {
       const avgSpeed = speedFrames.reduce((sum, item) => sum + item.speed, 0) / speedFrames.length
       return { track, path, net, avgSpeed, straightness: path === 0 ? 0 : net / path }
     })
+    // 原地闪烁（静态物体边缘的压缩噪声）不算运动：连续多帧却几乎没挪位的轨迹直接丢掉。
+    // 只判 3 帧以上的轨迹——一两帧的短事件还没法区分“闪一下”和“真是动了一下”
+    .filter(entry => entry.track.frames.length < 3 || entry.path >= Math.max(5, diag * 0.008))
     .sort((a, b) => (b.net / diag + b.track.frames.length / 8) - (a.net / diag + a.track.frames.length / 8))
     .slice(0, maxTracks)
 
@@ -1259,11 +1362,10 @@ export async function scanVideo(options, signal) {
   const startSeek = clampNumber(options.start_s, 0, 86400, 0)
   const durationWanted = options.duration_s === undefined ? undefined : clampNumber(options.duration_s, 0.2, 3600, 20)
   const dotSize = Math.round(clampNumber(options.dot_size, 1, 7, 3))
-  const minArea = Math.round(clampNumber(options.min_area, 1, 40, 3))
+  const minArea = Math.round(clampNumber(options.min_area, 1, 40, 1))
   const onion = clampNumber(options.onion, 0, 0.7, 0.45)
   const trailLength = Math.round(clampNumber(options.trail, 0, 3, 2))
   const drawArrows = options.arrows === undefined ? true : options.arrows !== false
-  const minThreshold = 4 + (1 - sensitivity) * 16
 
   // 先探一次元信息（一次轻量解码，几毫秒；也可同时校验文件可读）
   const probeArgs = ['-hide_banner', '-i', videoPath]
@@ -1291,7 +1393,7 @@ export async function scanVideo(options, signal) {
   const aspect = source.width !== undefined && source.height !== undefined ? source.height / source.width : 0.5625
   const autoWidth = Math.round(Math.sqrt(97200 / aspect))
   const width = Math.round(clampNumber(options.width, 160, 640, clampNumber(autoWidth, 200, DEFAULT_WIDTH, DEFAULT_WIDTH)) / 2) * 2
-  const gridCols = Math.round(clampNumber(options.grid, 8, 48, Math.max(8, Math.round(width / 15))))
+  const gridCols = Math.round(clampNumber(options.grid, 8, 64, Math.max(8, Math.min(64, Math.round(width / 8)))))
   const height = Math.max(2, Math.round((width * aspect) / 2) * 2)
 
   const runId = newRunId(videoPath)
@@ -1327,6 +1429,7 @@ export async function scanVideo(options, signal) {
   const stats = []
   const sheets = []
   let prevHalf = null
+  let prevLuma = null
   let prevClean = null
   let prevPoints = []
   let prevPointGap = 1
@@ -1338,19 +1441,27 @@ export async function scanVideo(options, signal) {
     // 保留一份“未标注”副本给下一帧做洋葱皮残影，避免残影里出现上一帧的箭头
     const cleanCopy = index < frames.length - 1 ? Buffer.from(frame) : null
     const half = halfGray(frame, width, height)
+    // 逐像素亮度：细颗粒/灰烬只有 1~4 像素，必须按像素做帧差，不能被格子均值稀释掉
+    const luma = lumaPlane(frame, width, height)
     const grid = gridMeans(frame, width, height, gridCols, rows)
     const time = index === 0 ? startSeek : startSeek + index / fps
     let motion = null
     let camera = null
     let compensatedPrev = null
     let alignedGrid = null
-    if (index > 0 && prevHalf !== null) {
+    if (index > 0 && prevHalf !== null && prevLuma !== null) {
       // 镜头补偿：先把背景对齐，剩下的差异才是物体自身运动
       const shift = estimateGlobalShift(prevHalf, half)
       camera = { dx: shift.dx * 2, dy: shift.dy * 2 }
       compensatedPrev = shift.dx === 0 && shift.dy === 0 ? prevHalf : shiftPlane(prevHalf, shift.dx, shift.dy)
       alignedGrid = gridMeansPlane(compensatedPrev.plane, compensatedPrev.w, compensatedPrev.h, gridCols, rows)
-      motion = detectMotion(alignedGrid, grid, gridCols, rows, minThreshold, maxPoints, minArea)
+      const energy = cellMotionEnergy(prevLuma, luma, width, height, gridCols, rows, camera.dx, camera.dy)
+      motion = detectMotion(alignedGrid, grid, gridCols, rows, {
+        activity: energy.energy,
+        sensitivity,
+        maxPoints,
+        minArea,
+      })
     }
 
     const points = []
@@ -1379,9 +1490,11 @@ export async function scanVideo(options, signal) {
         // 单帧团块数量上限，防止爆闪/全屏变化时标注与统计规模失控
         if (blobIndex >= 24) break
         const blob = motion.blobs[blobIndex]
-        // 和背景亮度几乎一样的团块（地面反光、边缘噪声）不参与标注，防止空地上出现乱箭头
-        const saliency = blobSaliency(grid, blob, gridCols, rows)
-        if (saliency < 10) {
+        // 和背景亮度几乎一样的团块（地面反光、边缘噪声）不参与标注，防止空地上出现乱箭头。
+        // 门限按画面整体亮度缩放：暗场里 10 灰阶已经很显眼，固定 10 会把细颗粒全滤掉
+        const saliencyFloor = Math.max(1.5, Math.min(6, motion.curMean * 0.04))
+        const saliency = blobSaliency(luma, width, height, blob, cellW, cellH)
+        if (saliency < saliencyFloor) {
           blob.skip = true
           continue
         }
@@ -1412,12 +1525,18 @@ export async function scanVideo(options, signal) {
         blob.color = pickAnnotationColor(background)
         blob.background = background
 
+        const blobW = Math.round((blob.box.x1 - blob.box.x0 + 1) * cellW * sx)
+        const blobH = Math.round((blob.box.y1 - blob.box.y0 + 1) * cellH * sy)
         blobs.push({
           area: blob.area,
+          area_px: Math.round(blob.area * cellW * sx * cellH * sy),
+          salience: Math.round(saliency * 10) / 10,
           x: Math.round(blob.centerX * sx),
           y: Math.round(blob.centerY * sy),
-          w: Math.round((blob.box.x1 - blob.box.x0 + 1) * cellW * sx),
-          h: Math.round((blob.box.y1 - blob.box.y0 + 1) * cellH * sy),
+          w: blobW,
+          h: blobH,
+          // 团块自身的合并半径：小颗粒只允许和贴着的团块合并，大主体（人/车）才吃得下 0.16 对角线
+          merge_radius: Math.max(cellW * sx * 2.5, Math.max(blobW, blobH) * 1.6),
           dx: Math.round(vx * sx),
           dy: Math.round(vy * sy),
           dir: directionLabel(vx, vy),
@@ -1578,6 +1697,7 @@ export async function scanVideo(options, signal) {
     })
     prevClean = cleanCopy
     prevHalf = half
+    prevLuma = luma
   }
 
   // ── 跨帧轨迹：同一物体固定编号，并把编号标回帧上（文字报告与图片用同一套编号） ──
@@ -1892,16 +2012,16 @@ const PARAMETERS = {
     },
     video_path: { type: 'string', description: 'scan 必填：视频绝对路径（mp4/mov/mkv/webm/avi/m4v/ts/gif）。' },
     fps: { type: 'number', description: '每秒抽几帧，默认 4；帧数超过 max_frames 会自动降低。' },
-    width: { type: 'number', description: '输出画面宽度像素，默认 360（越小越快越省 token）。' },
+    width: { type: 'number', description: '输出画面宽度像素，默认按屏幕比例自动（上限 480，横屏约 415）；细颗粒场景建议 480 以上。' },
     max_frames: { type: 'number', description: '本次最多抽多少帧，默认 18，上限 60。' },
     max_points: { type: 'number', description: '每帧最多几个红点/箭头，默认 12，上限 24；每个点都会带一支自己的方向箭头。' },
     max_tracks: { type: 'number', description: '最多输出几条物体轨迹（编号 #1…#N），默认 8，上限 12；多人/多物体场景不要低于画面里的运动物体数。' },
     sensitivity: { type: 'number', description: '运动灵敏度 0~1，默认 0.7；越大越灵敏（红点/箭头更多、更容易被噪声触发）。' },
-    grid: { type: 'number', description: '运动网格列数，默认按宽度自动（约每 15 像素一格）。' },
+    grid: { type: 'number', description: '运动网格列数，默认按宽度自动（约每 8 像素一格，上限 64）；格子越细越能抓到细颗粒，但更快吃噪声。' },
     start_s: { type: 'number', description: '从视频第几秒开始，默认 0。' },
     duration_s: { type: 'number', description: '只处理多长的一段（秒）；省略则尽量铺满整段（受 max_frames 限制）。' },
     dot_size: { type: 'number', description: '红点边长像素，默认 3（尽量小），最大 7。' },
-    min_area: { type: 'number', description: '运动团块最小格数，默认 3；调大可滤掉更多小噪声，调小可保留远处小物体。' },
+    min_area: { type: 'number', description: '运动团块最小格数，默认 1（细颗粒只占一格也算）；调大可滤掉更多小噪声，调小可保留远处小物体。' },
     onion: { type: 'number', description: '洋葱皮强度 0~0.7，默认 0.45：0 关闭，越大上一帧残影越明显。' },
     trail: { type: 'number', description: '洋葱皮节点数 0~3，默认 2：在上一帧/上上帧位置画空心圆环，串起运动路径。' },
     arrows: { type: 'boolean', description: '是否画方向箭头，默认 true；箭头从上一帧节点指向当前节点、尾淡头亮，颜色按背景自动取高对比色。' },
@@ -2027,7 +2147,9 @@ export function apply(ctx) {
         'action=frames：run_id + indices（如 "1,3,5-8"）取单帧原图，用于放大看细节。',
         'action=runs / purge：查看或清理临时图片缓存。',
         '',
-        '设计与成本：低采样率（默认 2fps）+ 小宽度（默认 360）单趟解码，帧差在纯 JS 网格上做，耗时/能耗远低于逐帧全分辨率分析；',
+        '设计与成本：低采样率（默认 4fps）+ 小宽度（横屏自动约 415，上限 480）单趟解码，帧差在纯 JS 里逐像素做，耗时/能耗远低于逐帧全分辨率分析；',
+        '暗场/低对比度：阈值按本帧噪声自适应（median + k×下四分位噪声），细颗粒按“每格最强 5% 像素”保信号，不靠固定 8.8 灰阶地板。',
+        '画面太暗、颗粒太小仍测不到时：把 width 提到 480~640、min_area 设为 1、sensitivity 提到 0.8~1。',
         '若当前模型路由未声明 image 输入，scan/frames 会直接报错并提示切换视觉模型（不降级成纯文本）。',
         '镜头整体位移会被自动估计并补偿：文字里的“镜头”是镜头自身位移，轨迹只表示相对背景的物体真实运动。',
         '看不清运动方向时：降低 fps 让每帧位移更大，或调高 onion（残影更明显）、trail 设 3。',
@@ -2208,6 +2330,9 @@ export const internals = {
   parseIndexList,
   frameFiles,
   detectMotion,
+  lumaPlane,
+  cellMotionEnergy,
+  blobSaliency,
   gridMeans,
   drawText,
   ROOT,
